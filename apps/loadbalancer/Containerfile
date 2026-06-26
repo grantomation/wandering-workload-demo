@@ -1,0 +1,23 @@
+FROM node:18-alpine
+
+# Install nginx
+RUN apk add --no-cache nginx bash
+
+# Set up working directory
+WORKDIR /app
+
+# Copy application files
+COPY package.json server.js dashboard.html switch_backend.sh ./
+COPY config.yaml ./
+
+# Copy nginx base config
+RUN mkdir -p /etc/nginx/conf.d nginx_conf && \
+    echo -e 'proxy_set_header Host localhost;\nproxy_pass http://localhost:8080;' > /etc/nginx/conf.d/active_backend.conf
+COPY nginx_conf/nginx.conf /etc/nginx/nginx.conf
+
+# Make the switch script executable
+RUN chmod +x switch_backend.sh
+
+# Start both Nginx and Node.js
+# Nginx runs in the background, Node server in the foreground
+CMD nginx && node server.js

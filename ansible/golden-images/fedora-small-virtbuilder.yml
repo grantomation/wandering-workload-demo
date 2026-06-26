@@ -1,0 +1,195 @@
+---
+# ALTERNATIVE to fedora-small.yml: builds the image at the target size FROM THE
+# START with virt-builder, instead of building at 5 GB and shrinking. The big
+# (5 GB) disk never materializes. Runs on a Linux KVM/libvirt build host — never
+# boots the image.
+#
+# *** READ THIS BEFORE USING ON STAGE ***
+# virt-builder does NOT use Fedora-Cloud-Base-Generic. It builds from the
+# libguestfs virt-builder template ("fedora-44"), which has its OWN partition
+# layout and is NOT guaranteed to carry the same pre-baked virtio + cloud-init
+# that lets you run MTV in raw-copy / skip-guest-conversion mode. That raw-copy
+# trick is what kills the ~45-min guest conversion (see virt_prep.md). So before
+# you trust this image for a live demo you MUST migrate one clone and confirm:
+#   1. skip-guest-conversion still boots clean (no virtio = no boot), and
+#   2. the "Convert image to kubevirt" phase is absent from the MTV pipeline.
+# If either fails, fall back to golden_small.yml (Cloud Base + shrink), which
+# keeps the proven guest.
+#
+# Why you'd still want this: a genuinely small disk from byte zero, no 5 GB
+# intermediate, no virt-resize / filesystem-shrink caveats (xfs etc.).
+#
+# Usage (from the libvirt build host):
+#   ansible-playbook fedora-small-virtbuilder.yml
+#   ansible-playbook fedora-small-virtbuilder.yml -e target_size=2G   # if 1G won't fit
+#   virt-builder --list | grep -i fedora    # confirm the template name first
+#
+# Writes the SAME wandering_small.* outputs as golden_small.yml — these are two
+# approaches to the same product, run whichever one you've chosen, not both.
+- name: Build the golden VM image small from the start (virt-builder)
+  hosts: localhost
+  connection: local
+
+  vars:
+    # --- Paths (resolved to absolute) ---
+    golden_dir: "{{ (playbook_dir + '/../..') | realpath }}"
+    repo_src: "{{ (playbook_dir + '/..') | realpath }}"
+
+    # --- virt-builder template (NOT the Cloud Base qcow) ---
+    # Check `virt-builder --list | grep fedora` for the exact name available in
+    # your index; drop to fedora-43 etc. if 44 isn't published yet.
+    vb_template: "fedora-44"
+
+    # --- Disk size: laid down at this size from the start (no shrink) ---
+    # 1G as requested. If the content doesn't fit, virt-builder fails and prints
+    # the minimum size it needs — bump target_size to that measured number.
+    target_size: "1G"
+
+    # --- Output filenames (same product as golden_small.yml) ---
+    small_image: "{{ golden_dir }}/wandering_small.qcow2"
+    output_vmdk: "{{ golden_dir }}/wandering_small.vmdk"
+
+    # --- Guest config (identical to golden.yml) ---
+    guest_password: openshift
+    guest_packages:
+      - qemu-guest-agent
+      - ansible-core
+      - acl
+
+    # --- VMDK subformat ---
+    # monolithicSparse = datastore browser upload; streamOptimized = ovftool/OVF
+    vmdk_subformat: monolithicSparse
+
+  tasks:
+    # ----- 0. Preflight: confirm the repo and template are sane -----
+    - name: Check that the repo source exists
+      ansible.builtin.stat:
+        path: "{{ repo_src }}"
+      register: repo_stat
+
+    - name: Fail if the repo is not where we expect it
+      ansible.builtin.assert:
+        that: repo_stat.stat.exists and repo_stat.stat.isdir
+        fail_msg: >-
+          Expected the wandering_workload repo at {{ repo_src }}.
+          Clone it there or override with -e repo_src=/path/to/repo.
+
+    - name: Confirm the virt-builder template is available
+      become: true
+      ansible.builtin.shell: "virt-builder --list | grep -q '^{{ vb_template }} '"
+      args:
+        executable: /bin/bash
+      register: vb_list
+      changed_when: false
+      failed_when: vb_list.rc != 0
+
+    # ----- 1. Build the image at target_size, install + configure in one shot -----
+    # Mirrors golden.yml's virt-customize flags exactly; virt-builder just also
+    # owns disk creation and sizing. --selinux-relabel because we --install
+    # packages and copy files in (wrong labels = boot/login failures).
+    - name: Build the image small from the start (virt-builder)
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - virt-builder
+          - "{{ vb_template }}"
+          - --size
+          - "{{ target_size }}"
+          - --format
+          - qcow2
+          - --output
+          - "{{ small_image }}"
+          - --install
+          - "{{ guest_packages | join(',') }}"
+          - --run-command
+          - systemctl enable qemu-guest-agent
+          - --root-password
+          - "password:{{ guest_password }}"
+          - --run-command
+          - useradd -m fedora
+          - --password
+          - "fedora:password:{{ guest_password }}"
+          - --run-command
+          - "echo 'fedora ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/fedora"
+          - --run-command
+          - "chmod 0440 /etc/sudoers.d/fedora"
+          - --copy-in
+          - "{{ repo_src }}:/home/fedora/"
+          - --run-command
+          - chown -R 1000:1000 /home/fedora/wandering_workload
+          - --run-command
+          - dnf clean all
+          - --selinux-relabel
+      changed_when: true
+
+    # ----- 2. Seal (virt-builder leaves machine-id/SSH keys clean already, but
+    #         match golden.yml so every clone is guaranteed unique) -----
+    - name: Seal the image (strip machine-id, SSH host keys, logs, cloud-init state)
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - virt-sysprep
+          - -a
+          - "{{ small_image }}"
+      changed_when: true
+
+    - name: Sparsify the image (reclaim unused blocks)
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - virt-sparsify
+          - --in-place
+          - "{{ small_image }}"
+      changed_when: true
+
+    # ----- 3. Convert to VMDK -----
+    - name: Convert the qcow2 to VMDK ({{ vmdk_subformat }})
+      become: true
+      ansible.builtin.command:
+        argv:
+          - qemu-img
+          - convert
+          - -f
+          - qcow2
+          - -O
+          - vmdk
+          - -o
+          - "subformat={{ vmdk_subformat }}"
+          - "{{ small_image }}"
+          - "{{ output_vmdk }}"
+      changed_when: true
+
+    # ----- 4. Report virtual size + file size, and remind about the re-test -----
+    - name: Read back the qcow virtual size
+      become: true
+      ansible.builtin.command:
+        argv:
+          - qemu-img
+          - info
+          - "{{ small_image }}"
+      register: small_info
+      changed_when: false
+
+    - name: Show the VMDK file size
+      ansible.builtin.command:
+        argv:
+          - ls
+          - -lh
+          - "{{ output_vmdk }}"
+      register: vmdk_size
+      changed_when: false
+
+    - name: Done — but verify before stage
+      ansible.builtin.debug:
+        msg: >-
+          Small image built from {{ vb_template }}. qcow info:
+          {{ small_info.stdout_lines }} | VMDK: {{ vmdk_size.stdout }}.
+          BEFORE trusting on stage: migrate one clone with skip-guest-conversion
+          and confirm it boots clean and the convert-to-kubevirt phase is absent.
+          If not, use golden_small.yml (Cloud Base + shrink) instead.

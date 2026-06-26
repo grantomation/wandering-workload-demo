@@ -1,0 +1,307 @@
+---
+# All-in-one: deploys BOTH the PostgreSQL backend and the Node.js frontend on a
+# single server. The app talks to Postgres over the loopback (127.0.0.1), so there
+# is no /etc/hosts wiring and Postgres is not exposed off the box.
+#
+# Run this ON the server itself:
+#   sudo ansible-playbook combined.yml
+#
+# The app listens on port 80 by default (runs as root). Override with -e app_port=8080.
+#
+- name: Deploy the full Wandering Workload stack on one server
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    app_src: "{{ playbook_dir }}/.."
+    app_dir: /opt/wandering-workload
+    # Runs as root, so privileged ports (80) are fine. Override with -e app_port=8080.
+    app_port: 80
+
+    # --- Static IP for THIS host's NIC (NetworkManager). EDIT per host. ---
+    # Applied by default; runs `nmcli con up`, which reactivates the connection and
+    # WILL drop an SSH session - run from the console. Skip with `--skip-tags network`.
+    net_interface: ens192
+    net_static_ip: "198.51.100.202/24"     # the single all-in-one host (RFC 5737 — change for your network)
+    net_gateway: "198.51.100.1"
+    net_dns: "198.51.100.1,8.8.8.8"
+
+    # This host's persistent hostname. The single dual-role VM is wandering.
+    target_hostname: wandering
+
+    pg_data_dir: /var/lib/pgsql/data
+    db_name: todo
+    db_user: todo
+    db_password: todo
+    # Single-server: the app connects over loopback, so only allow local access.
+    db_host: 127.0.0.1
+    app_cidr: "127.0.0.1/32"
+
+    run_health_check: true
+    health_check_retries: 15
+
+  tasks:
+    # ----------------------------------------------------------------- network
+    # Pin this host's static IP first, so the box keeps its address (and working
+    # DNS/gateway for dnf) for the rest of the run. The activate step only fires
+    # when the address actually changes, so redeploys don't bounce the network.
+    - name: Find the NetworkManager connection for the NIC
+      ansible.builtin.command: nmcli -g GENERAL.CONNECTION device show {{ net_interface }}
+      register: nm_con
+      changed_when: false
+      tags: [network]
+
+    - name: Read the NIC's current IPv4 address
+      ansible.builtin.command: nmcli -g ipv4.addresses connection show "{{ nm_con.stdout }}"
+      register: nm_cur_addr
+      changed_when: false
+      tags: [network]
+
+    - name: Pin the static IPv4 configuration
+      ansible.builtin.command: >-
+        nmcli connection modify "{{ nm_con.stdout }}"
+        ipv4.method manual
+        ipv4.addresses {{ net_static_ip }}
+        ipv4.gateway {{ net_gateway }}
+        ipv4.dns "{{ net_dns }}"
+        ipv6.method ignore
+      when: nm_cur_addr.stdout != net_static_ip
+      register: nm_mod
+      tags: [network]
+
+    - name: Activate the static IPv4 configuration (briefly drops connectivity - console only)
+      ansible.builtin.command: nmcli connection up "{{ nm_con.stdout }}"
+      when: nm_mod is changed
+      tags: [network]
+
+    - name: Set the persistent hostname
+      ansible.builtin.hostname:
+        name: "{{ target_hostname }}"
+      when: ansible_facts['nodename'] != target_hostname
+      tags: [network, hostname]
+
+    # ---------------------------------------------------------------- packages
+    - name: Install Node.js, PostgreSQL and firewalld
+      ansible.builtin.dnf:
+        name:
+          - nodejs
+          - npm
+          - postgresql-server
+          - postgresql
+          - firewalld
+        state: present
+
+    # --------------------------------------------------------------- database
+    - name: Check whether the database cluster is initialised
+      ansible.builtin.stat:
+        path: "{{ pg_data_dir }}/PG_VERSION"
+      register: pg_initialised
+
+    - name: Initialise the database cluster
+      ansible.builtin.command: /usr/bin/postgresql-setup --initdb
+      when: not pg_initialised.stat.exists
+
+    - name: Listen on loopback only (single-server, no off-box access)
+      ansible.builtin.lineinfile:
+        path: "{{ pg_data_dir }}/postgresql.conf"
+        regexp: '^#?\s*listen_addresses\s*='
+        line: "listen_addresses = 'localhost'"
+      notify: Restart postgresql
+
+    - name: Allow the app to connect over loopback (password auth)
+      ansible.builtin.blockinfile:
+        path: "{{ pg_data_dir }}/pg_hba.conf"
+        insertbefore: BOF
+        marker: "# {mark} ANSIBLE MANAGED TODO-APP ACCESS"
+        block: |
+          host  {{ db_name }}  {{ db_user }}  {{ app_cidr }}  scram-sha-256
+      notify: Restart postgresql
+
+    - name: Enable and start PostgreSQL at boot
+      ansible.builtin.systemd:
+        name: postgresql
+        enabled: true
+        state: started
+
+    - name: Apply any pending config changes before loading data
+      ansible.builtin.meta: flush_handlers
+
+    - name: Create the application role
+      become_user: postgres
+      ansible.builtin.command:
+        cmd: >-
+          psql -d postgres -v ON_ERROR_STOP=1 -c
+          "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{{ db_user }}')
+          THEN CREATE ROLE {{ db_user }} LOGIN PASSWORD '{{ db_password }}'; END IF; END $$;"
+      changed_when: true
+
+    - name: Create the application database
+      become_user: postgres
+      ansible.builtin.shell:
+        cmd: >-
+          psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1
+          || psql -d postgres -c "CREATE DATABASE {{ db_name }} OWNER {{ db_user }}"
+      register: createdb
+      changed_when: "'CREATE DATABASE' in createdb.stdout"
+
+    - name: Create the stops table (the app expects this; IF NOT EXISTS preserves data across re-runs)
+      become_user: postgres
+      ansible.builtin.command:
+        cmd: >-
+          psql -d {{ db_name }} -v ON_ERROR_STOP=1 -c
+          "CREATE TABLE IF NOT EXISTS stops (
+             id SERIAL PRIMARY KEY,
+             name TEXT NOT NULL,
+             x REAL NOT NULL,
+             y REAL NOT NULL,
+             color TEXT NOT NULL,
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+           ALTER TABLE stops ADD COLUMN IF NOT EXISTS url TEXT;
+           ALTER TABLE stops OWNER TO {{ db_user }};"
+      changed_when: true
+
+    # --------------------------------------------------------------- frontend
+    - name: Create the application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copy application source
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ app_dir }}/"
+        mode: preserve
+      loop:
+        - "{{ app_src }}/server.js"
+        - "{{ app_src }}/package.json"
+      notify: Restart wandering-workload
+
+    - name: Copy static assets
+      ansible.builtin.copy:
+        src: "{{ app_src }}/public/"
+        dest: "{{ app_dir }}/public/"
+      notify: Restart wandering-workload
+
+    - name: Install Node dependencies (express, pg)
+      ansible.builtin.command:
+        cmd: npm install --omit=dev
+        chdir: "{{ app_dir }}"
+      register: npm_install
+      changed_when: "'added' in npm_install.stdout or 'changed' in npm_install.stdout"
+      notify: Restart wandering-workload
+
+    - name: Install the environment file
+      ansible.builtin.copy:
+        dest: /etc/wandering-workload.env
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          DB_HOST={{ db_host }}
+          DB_PORT=5432
+          DB_USER={{ db_user }}
+          DB_PASSWORD={{ db_password }}
+          DB_NAME={{ db_name }}
+          PORT={{ app_port }}
+      notify: Restart wandering-workload
+
+    - name: Install the systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/wandering-workload.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Wandering Workload (Node.js frontend)
+          After=network-online.target postgresql.service
+          Wants=network-online.target
+          Requires=postgresql.service
+
+          [Service]
+          Type=simple
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile=/etc/wandering-workload.env
+          ExecStart=/usr/bin/node {{ app_dir }}/server.js
+          Restart=always
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - Reload systemd
+        - Restart wandering-workload
+
+    - name: Enable and start the app at boot
+      ansible.builtin.systemd:
+        name: wandering-workload
+        enabled: true
+        daemon_reload: true
+        state: started
+
+    # ---------------------------------------------------------------- firewall
+    - name: Ensure firewalld is running
+      ansible.builtin.systemd:
+        name: firewalld
+        enabled: true
+        state: started
+
+    - name: Open the app port (Postgres stays on loopback, not exposed)
+      ansible.builtin.command: firewall-cmd --permanent --add-port={{ app_port }}/tcp
+      register: fw
+      changed_when: "'ALREADY_ENABLED' not in fw.stderr"
+
+    - name: Reload firewalld
+      ansible.builtin.command: firewall-cmd --reload
+      when: fw.changed
+
+    # ------------------------------------------------------------- reclaim
+    # Drop the dnf + npm caches left by the installs above. They add a few
+    # hundred MB the running app never needs, and on the shrunk ~1.7 GB disk
+    # (combined is the heaviest role) that headroom matters before an MTV migration.
+    - name: Reclaim the dnf cache
+      ansible.builtin.command: dnf clean all
+      changed_when: false
+      tags: [reclaim]
+
+    - name: Reclaim the npm cache
+      ansible.builtin.command: npm cache clean --force
+      changed_when: false
+      tags: [reclaim]
+
+    # ------------------------------------------------------------ health check
+    - name: Apply restarts before the health check
+      ansible.builtin.meta: flush_handlers
+
+    - name: Health check the app
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ app_port }}/health"
+        return_content: true
+      register: health
+      retries: "{{ health_check_retries }}"
+      delay: 2
+      until: health.status == 200
+      when: run_health_check | bool
+      failed_when: false
+
+    - name: Report health
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'App healthy: ' ~ health.content if (health.status | default(0)) == 200
+             else 'App did NOT report healthy. See: journalctl -u wandering-workload -e' }}
+      when: run_health_check | bool
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart wandering-workload
+      ansible.builtin.systemd:
+        name: wandering-workload
+        state: restarted
+
+    - name: Restart postgresql
+      ansible.builtin.systemd:
+        name: postgresql
+        state: restarted

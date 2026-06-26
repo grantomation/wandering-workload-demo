@@ -1,0 +1,48 @@
+---
+# Reverses everything frontend_alpine.yml deployed.
+# Run this ON the frontend VM itself:
+#   ansible-playbook frontend-undo_alpine.yml
+- name: Tear down the frontend Node.js stack (Alpine)
+  hosts: localhost
+  connection: local
+
+  vars:
+    app_dir: /opt/wandering-workload
+
+  tasks:
+    - name: Stop and disable the app service
+      ansible.builtin.service:
+        name: wandering-workload
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove the OpenRC init scripts
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/init.d/wandering-workload
+        - /etc/init.d/wandering-env-detect
+
+    - name: Remove the environment config file
+      ansible.builtin.file:
+        path: /etc/wandering-workload.env
+        state: absent
+
+    - name: Remove the application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: absent
+
+    - name: Stop and disable environment detection
+      ansible.builtin.service:
+        name: wandering-env-detect
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove environment detection script
+      ansible.builtin.file:
+        path: /usr/local/bin/wandering-env-detect.sh
+        state: absent

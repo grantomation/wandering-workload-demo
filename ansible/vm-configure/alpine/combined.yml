@@ -1,0 +1,293 @@
+---
+# All-in-one: deploys BOTH the PostgreSQL backend and the Node.js frontend on a
+# single server using Alpine Linux.
+#
+# Run this ON the server itself:
+#   ansible-playbook ansible/vm-configure/alpine/combined.yml
+- name: Deploy the full Wandering Workload stack on one server (Alpine)
+  hosts: localhost
+  connection: local
+
+  vars:
+    app_src: "{{ playbook_dir }}/../.."
+    app_dir: /opt/wandering-workload
+    app_port: 80
+
+    net_interface: eth0
+    net_static_ip: "198.51.100.202"
+    net_netmask: "255.255.255.0"
+    net_gateway: "198.51.100.1"
+    net_dns: "198.51.100.1 8.8.8.8"
+
+    target_hostname: wandering
+
+    pg_data_dir: /var/lib/postgresql/17/data
+    db_name: todo
+    db_user: todo
+    db_password: todo
+    db_host: 127.0.0.1
+    app_cidr: "127.0.0.1/32"
+
+    run_health_check: true
+    health_check_retries: 15
+
+  tasks:
+    - name: Upgrade all packages (prevent partial upgrade library errors)
+      ansible.builtin.command: apk upgrade --no-cache
+      changed_when: false
+
+    - name: Install packages
+      ansible.builtin.command: apk add --no-cache nodejs npm curl postgresql postgresql-client virt-what
+      changed_when: false
+
+    - name: Install the environment detection script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/wandering-env-detect.sh
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          VIRT=$(virt-what 2>/dev/null || echo "unknown")
+
+          cat > /etc/network/interfaces <<'EOF'
+          auto lo
+          iface lo inet loopback
+
+          auto {{ net_interface }}
+          EOF
+
+          if echo "$VIRT" | grep -q "vmware"; then
+              cat >> /etc/network/interfaces <<'EOF'
+          iface {{ net_interface }} inet static
+            address {{ net_static_ip }}
+            netmask {{ net_netmask }}
+            gateway {{ net_gateway }}
+          EOF
+              cat > /etc/resolv.conf <<'EOF'
+          nameserver {{ net_dns.split()[0] }}
+          nameserver 8.8.8.8
+          EOF
+              echo "wandering-env-detect: VMware detected, static network applied."
+          else
+              cat >> /etc/network/interfaces <<'EOF'
+          iface {{ net_interface }} inet dhcp
+          EOF
+              echo "wandering-env-detect: ${VIRT} detected, DHCP network applied."
+          fi
+
+    - name: Install the environment detection OpenRC service
+      ansible.builtin.copy:
+        dest: /etc/init.d/wandering-env-detect
+        mode: "0755"
+        content: |
+          #!/sbin/openrc-run
+          description="Wandering Workload environment detection"
+
+          depend() {
+              before networking
+          }
+
+          start() {
+              ebegin "Running wandering-env-detect"
+              /usr/local/bin/wandering-env-detect.sh
+              eend $?
+          }
+
+    - name: Enable the environment detection service at boot
+      ansible.builtin.service:
+        name: wandering-env-detect
+        enabled: true
+
+    - name: Check whether the database cluster is initialised
+      ansible.builtin.stat:
+        path: "{{ pg_data_dir }}/PG_VERSION"
+      register: pg_initialised
+
+    - name: Initialise the database cluster
+      ansible.builtin.command: /etc/init.d/postgresql setup
+      when: not pg_initialised.stat.exists
+
+    - name: Listen on loopback only
+      ansible.builtin.lineinfile:
+        path: "{{ pg_data_dir }}/postgresql.conf"
+        regexp: '^#?\s*listen_addresses\s*='
+        line: "listen_addresses = 'localhost'"
+      notify: Restart postgresql
+
+    - name: Allow the app to connect over loopback
+      ansible.builtin.blockinfile:
+        path: "{{ pg_data_dir }}/pg_hba.conf"
+        insertbefore: BOF
+        marker: "# {mark} ANSIBLE MANAGED TODO-APP ACCESS"
+        block: |
+          host  {{ db_name }}  {{ db_user }}  {{ app_cidr }}  scram-sha-256
+      notify: Restart postgresql
+
+    - name: Enable and start PostgreSQL at boot
+      ansible.builtin.service:
+        name: postgresql
+        enabled: true
+        state: started
+
+    - name: Wait for PostgreSQL to be ready
+      ansible.builtin.command: >-
+        su - postgres -c "psql -d postgres -tAc 'SELECT 1'"
+      register: pg_ready
+      retries: 10
+      delay: 2
+      until: pg_ready.rc == 0
+      changed_when: false
+
+    - name: Create the application role
+      ansible.builtin.command:
+        cmd: >-
+          su - postgres -c "psql -d postgres -v ON_ERROR_STOP=1 -c
+          \"DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{{ db_user }}')
+          THEN CREATE ROLE {{ db_user }} LOGIN PASSWORD '{{ db_password }}'; END IF; END \$\$;\""
+      changed_when: true
+
+    - name: Create the application database
+      ansible.builtin.shell:
+        cmd: >-
+          su - postgres -c "psql -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'\"" | grep -q 1
+          || su - postgres -c "psql -d postgres -c \"CREATE DATABASE {{ db_name }} OWNER {{ db_user }}\""
+      register: createdb
+      changed_when: "'CREATE DATABASE' in createdb.stdout"
+
+    - name: Create the stops table
+      ansible.builtin.command:
+        cmd: >-
+          su - postgres -c "psql -d {{ db_name }} -v ON_ERROR_STOP=1 -c
+          \"CREATE TABLE IF NOT EXISTS stops (
+             id SERIAL PRIMARY KEY,
+             name TEXT NOT NULL,
+             x REAL NOT NULL,
+             y REAL NOT NULL,
+             color TEXT NOT NULL,
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+           ALTER TABLE stops ADD COLUMN IF NOT EXISTS url TEXT;
+           ALTER TABLE stops OWNER TO {{ db_user }};\""
+      changed_when: true
+
+    - name: Create the application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copy application source
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ app_dir }}/"
+        mode: preserve
+      loop:
+        - "{{ app_src }}/server.js"
+        - "{{ app_src }}/package.json"
+      notify: Restart wandering-workload
+
+    - name: Copy static assets
+      ansible.builtin.copy:
+        src: "{{ app_src }}/public/"
+        dest: "{{ app_dir }}/public/"
+      notify: Restart wandering-workload
+
+    - name: Install Node dependencies
+      ansible.builtin.command:
+        cmd: npm install --omit=dev
+        chdir: "{{ app_dir }}"
+      register: npm_install
+      changed_when: "'added' in npm_install.stdout or 'changed' in npm_install.stdout"
+      notify: Restart wandering-workload
+
+    - name: Install the environment file
+      ansible.builtin.copy:
+        dest: /etc/wandering-workload.env
+        mode: "0600"
+        content: |
+          DB_HOST={{ db_host }}
+          DB_PORT=5432
+          DB_USER={{ db_user }}
+          DB_PASSWORD={{ db_password }}
+          DB_NAME={{ db_name }}
+          PORT={{ app_port }}
+      notify: Restart wandering-workload
+
+    - name: Install the OpenRC service for the app
+      ansible.builtin.copy:
+        dest: /etc/init.d/wandering-workload
+        mode: "0755"
+        content: |
+          #!/sbin/openrc-run
+          description="Wandering Workload (Node.js frontend)"
+
+          depend() {
+              need net postgresql
+          }
+
+          supervisor=supervise-daemon
+          command="/usr/bin/node"
+          command_args="{{ app_dir }}/server.js"
+          directory="{{ app_dir }}"
+          output_log="/var/log/wandering-workload.log"
+          error_log="/var/log/wandering-workload.log"
+          respawn_delay=5
+          respawn_max=0
+
+          start_pre() {
+              . /etc/wandering-workload.env
+              export DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME PORT
+          }
+      notify: Restart wandering-workload
+
+    - name: Enable and start the app at boot
+      ansible.builtin.service:
+        name: wandering-workload
+        enabled: true
+        state: started
+
+    - name: Apply restarts before the health check
+      ansible.builtin.meta: flush_handlers
+
+    - name: Health check the app
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ app_port }}/health"
+        return_content: true
+      register: health
+      retries: "{{ health_check_retries }}"
+      delay: 2
+      until: health.status == 200
+      when: run_health_check | bool
+      failed_when: false
+
+    - name: Report health
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'App healthy: ' ~ health.content if (health.status | default(0)) == 200
+             else 'App did NOT report healthy. See: cat /var/log/wandering-workload.log' }}
+      when: run_health_check | bool
+
+    - name: Reclaim the npm cache
+      ansible.builtin.command: npm cache clean --force
+      changed_when: false
+      tags: [reclaim]
+
+    - name: Set the persistent hostname
+      ansible.builtin.hostname:
+        name: "{{ target_hostname }}"
+      tags: [network, hostname]
+
+    - name: Reboot the VM to apply networking and verify boot services
+      ansible.builtin.shell: sleep 2 && reboot
+      async: 10
+      poll: 0
+      changed_when: true
+
+  handlers:
+    - name: Restart wandering-workload
+      ansible.builtin.service:
+        name: wandering-workload
+        state: restarted
+
+    - name: Restart postgresql
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted

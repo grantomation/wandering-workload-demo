@@ -1,0 +1,312 @@
+---
+# Builds the golden VM image EXACTLY like fedora.yml, then shrinks the disk
+# GEOMETRY (virtual size) from 5 GB to ~1.7 GB so VMware allocates a small disk
+# and MTV has fewer blocks to walk. Runs on a Linux KVM/libvirt build host —
+# never boots the image. Same F44 Cloud Base guest as fedora.yml, so NO MTV
+# raw-copy re-test needed.
+#
+# Why the extra dance (all measured 2026-06-19 — see memory golden-disk-shrink):
+#   * Fedora Cloud Base root is BTRFS. virt-resize shrinks partitions but NOT
+#     the btrfs inside them, so it refuses to shrink unless the btrfs is shrunk
+#     FIRST. Hence the guestfish btrfs-filesystem-resize step below.
+#   * btrfs won't shrink below its ALLOCATED CHUNKS (~1.3 GB) without a balance,
+#     and an offline balance flips the fs read-only in the libguestfs appliance.
+#     So we DON'T balance — the reliable no-balance floor is btrfs=1600M (1550M
+#     already fails). With the 100M EFI partition + GPT overhead alongside, the
+#     smallest disk that fits is ~1740M (1700M fails). 1.6 GB disk / 1 GB are
+#     NOT reachable without the flaky balance.
+#   * After the btrfs is pre-shrunk, virt-resize shrinks the partition into a
+#     smaller disk and re-expands the btrfs to fill it. No --resize-force needed.
+#
+# Usage (from the libvirt build host):
+#   cd wandering-workload/ansible/golden-images
+#   ansible-playbook fedora-small.yml
+#   # squeeze tighter only if a probe shows the btrfs floor is lower:
+#   ansible-playbook fedora-small.yml -e btrfs_size=1500M -e target_size=1700M
+#
+# Produces wandering_small.qcow2 / wandering_small.vmdk alongside the normal
+# golden outputs (separate working file, nothing clobbered).
+- name: Build the golden VM image with a shrunk disk geometry
+  hosts: localhost
+  connection: local
+
+  vars:
+    # --- Paths (resolved to absolute — virt-customize doesn't handle '..') ---
+    golden_dir: "{{ (playbook_dir + '/../..') | realpath }}"
+    repo_src: "{{ (playbook_dir + '/..') | realpath }}"
+
+    # --- Fedora Cloud Base ---
+    fedora_ver: "44"
+    fedora_build: "1.7"
+    fedora_image: "Fedora-Cloud-Base-Generic-{{ fedora_ver }}-{{ fedora_build }}.x86_64.qcow2"
+    fedora_url: "https://download.fedoraproject.org/pub/fedora/linux/releases/{{ fedora_ver }}/Cloud/x86_64/images/{{ fedora_image }}"
+
+    # --- Output filenames (separate working file so the normal golden is safe) ---
+    working_image: "{{ golden_dir }}/wandering_small_work.qcow2"  # full-size build, then shrunk
+    small_image: "{{ golden_dir }}/wandering_small.qcow2"         # shrunk geometry
+    output_vmdk: "{{ golden_dir }}/wandering_small.vmdk"
+
+    # --- Shrink targets (measured floor; see header) ---
+    # btrfs_size: how far to pre-shrink the filesystem. No-balance floor is 1600M
+    #   (1550M fails). Don't lower without re-probing.
+    # target_size: the new disk geometry. 1740M is the tightest that fits the
+    #   1600M btrfs + 100M EFI + GPT overhead (1700M fails virt-resize).
+    btrfs_size: "1600M"
+    target_size: "1740M"
+
+    # --- Guest config (identical to golden.yml) ---
+    guest_password: openshift
+    guest_packages:
+      - qemu-guest-agent
+      - ansible-core
+      - acl
+
+    # --- VMDK subformat ---
+    # monolithicSparse  = datastore browser upload (no extra tools)
+    # streamOptimized   = ovftool / OVF import
+    vmdk_subformat: monolithicSparse
+
+  tasks:
+    # ----- 1. Download Fedora Cloud Base (skip if already present) -----
+    - name: Check whether the Fedora Cloud image already exists
+      ansible.builtin.stat:
+        path: "{{ golden_dir }}/{{ fedora_image }}"
+      register: fedora_stat
+
+    - name: Download Fedora Cloud Base
+      ansible.builtin.get_url:
+        url: "{{ fedora_url }}"
+        dest: "{{ golden_dir }}/{{ fedora_image }}"
+        mode: "0644"
+      when: not fedora_stat.stat.exists
+
+    # ----- 2. Create a fresh working copy -----
+    - name: Copy the base image to the working image
+      ansible.builtin.copy:
+        src: "{{ golden_dir }}/{{ fedora_image }}"
+        dest: "{{ working_image }}"
+        remote_src: true
+        force: true
+        mode: "0644"
+
+    # ----- 3. Customize the image offline (no boot) -----
+    - name: Check that the repo source exists
+      ansible.builtin.stat:
+        path: "{{ repo_src }}"
+      register: repo_stat
+
+    - name: Fail if the repo is not where we expect it
+      ansible.builtin.assert:
+        that: repo_stat.stat.exists and repo_stat.stat.isdir
+        fail_msg: >-
+          Expected the wandering_workload repo at {{ repo_src }}.
+          Clone it there or override with -e repo_src=/path/to/repo.
+
+    - name: Customize the golden image (install packages, set passwords, copy repo)
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - virt-customize
+          - -a
+          - "{{ working_image }}"
+          - --install
+          - "{{ guest_packages | join(',') }}"
+          - --run-command
+          - systemctl enable qemu-guest-agent
+          - --root-password
+          - "password:{{ guest_password }}"
+          - --run-command
+          - useradd -m fedora
+          - --password
+          - "fedora:password:{{ guest_password }}"
+          - --run-command
+          - "echo 'fedora ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/fedora"
+          - --run-command
+          - "chmod 0440 /etc/sudoers.d/fedora"
+          - --copy-in
+          - "{{ repo_src }}:/home/fedora/"
+          - --run-command
+          - chown -R 1000:1000 /home/fedora/wandering_workload
+          - --run-command
+          - dnf clean all
+      changed_when: true
+
+    # ----- 4. Seal the image -----
+    - name: Seal the image (strip machine-id, SSH host keys, logs, cloud-init state)
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - virt-sysprep
+          - -a
+          - "{{ working_image }}"
+      changed_when: true
+
+    - name: Sparsify the image (reclaim unused blocks)
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - virt-sparsify
+          - --in-place
+          - "{{ working_image }}"
+      changed_when: true
+
+    # ----- 5. Shrink the disk GEOMETRY (btrfs-aware, two steps) -----
+    - name: Show disk layout and filesystem types
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - virt-filesystems
+          - --long
+          - --parts
+          - --filesystems
+          - -h
+          - -a
+          - "{{ working_image }}"
+      register: fs_layout
+      changed_when: false
+
+    - name: Print the layout
+      ansible.builtin.debug:
+        var: fs_layout.stdout_lines
+
+    # The root partition is the largest one — find it so we don't hardcode a
+    # device name that shifts between Fedora releases.
+    - name: Identify the largest (root) partition
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        virt-filesystems -a "{{ working_image }}" --partitions --long --csv
+        | tail -n +2 | sort -t, -k4 -n | tail -1 | cut -d, -f1
+      args:
+        executable: /bin/bash
+      register: root_part
+      changed_when: false
+
+    - name: Report the plan
+      ansible.builtin.debug:
+        msg: >-
+          Pre-shrinking the btrfs on {{ root_part.stdout }} to {{ btrfs_size }},
+          then resizing into a {{ target_size }} disk.
+
+    # Step 1: shrink the btrfs filesystem itself (virt-resize can't do this).
+    - name: Pre-shrink the btrfs filesystem
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - guestfish
+          - --rw
+          - -a
+          - "{{ working_image }}"
+          - run
+          - ":"
+          - mount
+          - "{{ root_part.stdout }}"
+          - /
+          - ":"
+          - btrfs-filesystem-resize
+          - /
+          - "size:{{ btrfs_size }}"
+          - ":"
+          - umount-all
+      changed_when: true
+
+    # Step 2: shrink the partition into a smaller disk (virt-resize re-expands
+    # the btrfs to fill the new partition).
+    - name: Create the small target disk ({{ target_size }} geometry)
+      become: true
+      ansible.builtin.command:
+        argv:
+          - qemu-img
+          - create
+          - -f
+          - qcow2
+          - "{{ small_image }}"
+          - "{{ target_size }}"
+      changed_when: true
+
+    - name: Shrink-copy the golden into the small disk
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - virt-resize
+          - --shrink
+          - "{{ root_part.stdout }}"
+          - "{{ working_image }}"
+          - "{{ small_image }}"
+      changed_when: true
+
+    - name: Sparsify the small image (drop freed blocks)
+      become: true
+      environment:
+        LIBGUESTFS_BACKEND: direct
+      ansible.builtin.command:
+        argv:
+          - virt-sparsify
+          - --in-place
+          - "{{ small_image }}"
+      changed_when: true
+
+    # ----- 6. Convert to VMDK -----
+    - name: Convert the shrunk qcow2 to VMDK ({{ vmdk_subformat }})
+      become: true
+      ansible.builtin.command:
+        argv:
+          - qemu-img
+          - convert
+          - -f
+          - qcow2
+          - -O
+          - vmdk
+          - -o
+          - "subformat={{ vmdk_subformat }}"
+          - "{{ small_image }}"
+          - "{{ output_vmdk }}"
+      changed_when: true
+
+    # ----- 7. Clean up the intermediate working image -----
+    - name: Remove the full-size working image (no longer needed)
+      ansible.builtin.file:
+        path: "{{ working_image }}"
+        state: absent
+
+    # ----- 8. Report virtual size (the whole point) + file sizes -----
+    - name: Read back the shrunk qcow virtual size
+      become: true
+      ansible.builtin.command:
+        argv:
+          - qemu-img
+          - info
+          - "{{ small_image }}"
+      register: small_info
+      changed_when: false
+
+    - name: Show the shrunk VMDK file size
+      ansible.builtin.command:
+        argv:
+          - ls
+          - -lh
+          - "{{ output_vmdk }}"
+      register: vmdk_size
+      changed_when: false
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Shrunk image ready. qcow info: {{ small_info.stdout_lines }} |
+          VMDK: {{ vmdk_size.stdout }}. Confirm "virtual size" reads
+          ~{{ target_size }} (not 5 GiB) before uploading via the vSphere
+          datastore browser (virt_prep.md section 5).

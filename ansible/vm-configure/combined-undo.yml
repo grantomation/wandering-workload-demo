@@ -1,0 +1,83 @@
+---
+# Reverses everything combined.yml deployed on a single server: the Node.js app
+# AND the PostgreSQL backend.
+# Run this ON the server itself:
+#   sudo ansible-playbook combined-undo.yml
+#
+# FULL WIPE: stops the app and PostgreSQL, removes the app, its systemd unit, env
+# file, the firewall opening, and DELETES the entire PostgreSQL data
+# directory ({{ pg_data_dir }}) - every database, role, and row is destroyed.
+# It does NOT uninstall nodejs/npm/postgresql-server/firewalld.
+#
+# If you opened a non-default port on the way in, pass the same value back:
+#   sudo ansible-playbook combined-undo.yml -e app_port=8080
+- name: Tear down the full Wandering Workload stack
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    app_dir: /opt/wandering-workload
+    app_port: 80
+    pg_data_dir: /var/lib/pgsql/data
+
+  tasks:
+    # ---------------------------------------------------------------- services
+    - name: Stop and disable the app service
+      ansible.builtin.systemd:
+        name: wandering-workload
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Stop and disable PostgreSQL
+      ansible.builtin.systemd:
+        name: postgresql
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    # ---------------------------------------------------------------- frontend
+    - name: Remove the systemd unit files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/wandering-workload.service
+      notify: Reload systemd
+
+    - name: Remove the environment config file
+      ansible.builtin.file:
+        path: /etc/wandering-workload.env
+        state: absent
+
+    - name: Remove the application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: absent
+
+    # --------------------------------------------------------------- database
+    - name: Wipe the PostgreSQL data directory (destroys all databases and roles)
+      ansible.builtin.file:
+        path: "{{ pg_data_dir }}"
+        state: absent
+
+    # ---------------------------------------------------------------- firewall
+    - name: Close the app port (ignored if firewalld is gone or it was never open)
+      ansible.builtin.command: firewall-cmd --permanent --remove-port={{ app_port }}/tcp
+      register: fw
+      changed_when: "'ALREADY_DISABLED' not in fw.stderr"
+      failed_when: false
+
+    - name: Reload firewalld
+      ansible.builtin.command: firewall-cmd --reload
+      when: fw.changed | default(false)
+      failed_when: false
+
+    - name: Apply the systemd unit removals
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

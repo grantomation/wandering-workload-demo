@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Environment / credentials (never commit)
+.env
+.env.*
+credentials.env
+
+# Secrets and certificates
+*.key
+*.p12
+*.pem
+secret*.yaml
+letsencrypt/
+
+# Build artifacts (golden image outputs)
+build-output/
+
+# OS / editor junk
+.DS_Store
+.cursor/
+.claude/
+
+# Generated deploy artifacts
+apps/loadbalancer/deployment.yaml
+
+# Misc scratch files
+test.txt
+deets.txt

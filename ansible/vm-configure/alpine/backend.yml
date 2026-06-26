@@ -1,0 +1,207 @@
+---
+# Configures the PostgreSQL backend VM for the Wandering Workload app on Alpine.
+# Run this ON the database VM itself:
+#   ansible-playbook ansible/vm-configure/alpine/backend.yml
+- name: Configure the PostgreSQL backend VM (Alpine)
+  hosts: localhost
+  connection: local
+
+  vars_files:
+    - ../group_vars/all.yml
+
+  vars:
+    net_interface: eth0
+    net_static_ip: "{{ backend_ip }}"
+    net_netmask: "255.255.255.0"
+    net_gateway: "198.51.100.1"
+    net_dns: "198.51.100.1 8.8.8.8"
+
+    target_hostname: ww_be
+
+    pg_data_dir: /var/lib/postgresql/17/data
+    db_name: todo
+    db_user: todo
+    db_password: todo
+    app_cidr: "0.0.0.0/0"
+
+  tasks:
+    - name: Upgrade all packages (prevent partial upgrade library errors)
+      ansible.builtin.command: apk upgrade --no-cache
+      changed_when: false
+
+    - name: Install virt-what
+      ansible.builtin.command: apk add --no-cache virt-what
+      changed_when: false
+
+    - name: Install the environment detection script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/wandering-env-detect.sh
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          MARKER_START="# BEGIN WANDERING-WORKLOAD SERVICE EMULATION"
+          MARKER_END="# END WANDERING-WORKLOAD SERVICE EMULATION"
+          VIRT=$(virt-what 2>/dev/null || echo "unknown")
+
+          sed -i "/${MARKER_START}/,/${MARKER_END}/d" /etc/hosts
+
+          cat > /etc/network/interfaces <<'EOF'
+          auto lo
+          iface lo inet loopback
+
+          auto {{ net_interface }}
+          EOF
+
+          if echo "$VIRT" | grep -q "vmware"; then
+              cat >> /etc/hosts <<EOF
+          ${MARKER_START}
+          {{ backend_ip }}  {{ backend_svc_name }}
+          ${MARKER_END}
+          EOF
+              cat >> /etc/network/interfaces <<'EOF'
+          iface {{ net_interface }} inet static
+            address {{ net_static_ip }}
+            netmask {{ net_netmask }}
+            gateway {{ net_gateway }}
+          EOF
+              cat > /etc/resolv.conf <<'EOF'
+          nameserver {{ net_dns.split()[0] }}
+          nameserver 8.8.8.8
+          EOF
+              echo "wandering-env-detect: VMware detected, static network & DNS applied."
+          else
+              cat >> /etc/network/interfaces <<'EOF'
+          iface {{ net_interface }} inet dhcp
+          EOF
+              echo "wandering-env-detect: ${VIRT} detected, DHCP network applied."
+          fi
+      notify: Run environment detection
+
+    - name: Install the environment detection OpenRC service
+      ansible.builtin.copy:
+        dest: /etc/init.d/wandering-env-detect
+        mode: "0755"
+        content: |
+          #!/sbin/openrc-run
+          description="Wandering Workload environment detection"
+
+          depend() {
+              before networking
+              before postgresql
+          }
+
+          start() {
+              ebegin "Running wandering-env-detect"
+              /usr/local/bin/wandering-env-detect.sh
+              eend $?
+          }
+      notify: Run environment detection
+
+    - name: Enable the environment detection service at boot
+      ansible.builtin.service:
+        name: wandering-env-detect
+        enabled: true
+
+    - name: Run environment detection now
+      ansible.builtin.service:
+        name: wandering-env-detect
+        state: started
+
+    - name: Install PostgreSQL
+      ansible.builtin.command: apk add --no-cache postgresql postgresql-client
+      changed_when: false
+
+    - name: Check whether the database cluster is initialised
+      ansible.builtin.stat:
+        path: "{{ pg_data_dir }}/PG_VERSION"
+      register: pg_initialised
+
+    - name: Initialise the database cluster
+      ansible.builtin.command: /etc/init.d/postgresql setup
+      when: not pg_initialised.stat.exists
+
+    - name: Listen on all interfaces
+      ansible.builtin.lineinfile:
+        path: "{{ pg_data_dir }}/postgresql.conf"
+        regexp: '^#?\s*listen_addresses\s*='
+        line: "listen_addresses = '*'"
+      notify: Restart postgresql
+
+    - name: Allow the app to connect over the network
+      ansible.builtin.blockinfile:
+        path: "{{ pg_data_dir }}/pg_hba.conf"
+        marker: "# {mark} ANSIBLE MANAGED TODO-APP ACCESS"
+        block: |
+          host  {{ db_name }}  {{ db_user }}  {{ app_cidr }}  scram-sha-256
+      notify: Restart postgresql
+
+    - name: Enable and start PostgreSQL at boot
+      ansible.builtin.service:
+        name: postgresql
+        enabled: true
+        state: started
+
+    - name: Apply any pending config changes before loading data
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for PostgreSQL to be ready
+      ansible.builtin.command: >-
+        su - postgres -c "psql -d postgres -tAc 'SELECT 1'"
+      register: pg_ready
+      retries: 10
+      delay: 2
+      until: pg_ready.rc == 0
+      changed_when: false
+
+    - name: Create the application role
+      ansible.builtin.command:
+        cmd: >-
+          su - postgres -c "psql -d postgres -v ON_ERROR_STOP=1 -c
+          \"DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{{ db_user }}')
+          THEN CREATE ROLE {{ db_user }} LOGIN PASSWORD '{{ db_password }}'; END IF; END \$\$;\""
+      changed_when: true
+
+    - name: Create the application database
+      ansible.builtin.shell:
+        cmd: >-
+          su - postgres -c "psql -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'\"" | grep -q 1
+          || su - postgres -c "psql -d postgres -c \"CREATE DATABASE {{ db_name }} OWNER {{ db_user }}\""
+      register: createdb
+      changed_when: "'CREATE DATABASE' in createdb.stdout"
+
+    - name: Create the stops table
+      ansible.builtin.command:
+        cmd: >-
+          su - postgres -c "psql -d {{ db_name }} -v ON_ERROR_STOP=1 -c
+          \"CREATE TABLE IF NOT EXISTS stops (
+             id SERIAL PRIMARY KEY,
+             name TEXT NOT NULL,
+             x REAL NOT NULL,
+             y REAL NOT NULL,
+             color TEXT NOT NULL,
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+           ALTER TABLE stops ADD COLUMN IF NOT EXISTS url TEXT;
+           ALTER TABLE stops OWNER TO {{ db_user }};\""
+      changed_when: true
+
+    - name: Set the persistent hostname
+      ansible.builtin.hostname:
+        name: "{{ target_hostname }}"
+      tags: [network, hostname]
+
+    - name: Reboot the VM to apply networking and verify boot services
+      ansible.builtin.shell: sleep 2 && reboot
+      async: 10
+      poll: 0
+      changed_when: true
+
+  handlers:
+    - name: Restart postgresql
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+
+    - name: Run environment detection
+      ansible.builtin.service:
+        name: wandering-env-detect
+        state: restarted
